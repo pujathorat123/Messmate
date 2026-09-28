@@ -45,16 +45,22 @@ function Toast() {
 function MainContent() {
   const { currentPage } = useApp();
 
-  return (
-    <main className="flex-1 w-full">
-      {currentPage === 'home' && <HomePage />}
-      {currentPage === 'find' && <FindMessPage />}
-      {currentPage === 'mess-details' && <MessDetailPage />}
-      {currentPage === 'compare' && <ComparePage />}
-      {currentPage === 'confirm' && <ConfirmPage />}
-      {currentPage === 'reviews' && <ReviewsPage />}
-    </main>
-  );
+  switch (currentPage) {
+    case 'home':
+      return <HomePage />;
+    case 'find':
+      return <FindMessPage />;
+    case 'mess-details':
+      return <MessDetailPage />;
+    case 'compare':
+      return <ComparePage />;
+    case 'confirm':
+      return <ConfirmPage />;
+    case 'reviews':
+      return <ReviewsPage />;
+    default:
+      return <HomePage />;
+  }
 }
 
 export default function App() {
@@ -62,7 +68,9 @@ export default function App() {
     <AppProvider>
       <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900 font-sans selection:bg-emerald-500 selection:text-white">
         <Navbar />
-        <MainContent />
+        <main className="flex-1 w-full">
+          <MainContent />
+        </main>
         <CompareFloatingBar />
         <Toast />
         <Footer />

@@ -2,30 +2,42 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 
 const AppContext = createContext();
 
+// Helper to reliably parse hash and query parameters
+function parseHash(hashStr) {
+  if (!hashStr) return { page: 'home', params: {}, messId: null };
+  
+  // Remove leading # and optional /
+  const clean = hashStr.replace(/^#\/?/, '');
+  const [pathPart, queryPart] = clean.split('?');
+  
+  let page = 'home';
+  let messId = null;
+
+  if (pathPart && pathPart.startsWith('mess/')) {
+    page = 'mess-details';
+    messId = pathPart.replace('mess/', '').split('/')[0] || null;
+  } else if (pathPart) {
+    page = pathPart.replace(/\/$/, '') || 'home';
+  }
+
+  const params = {};
+  if (queryPart) {
+    const searchParams = new URLSearchParams(queryPart);
+    for (const [k, v] of searchParams.entries()) {
+      params[k] = v;
+    }
+  }
+
+  return { page, params, messId };
+}
+
 export function AppProvider({ children }) {
-  // Navigation state with hash sync
-  const [currentPage, setCurrentPage] = useState(() => {
-    const hash = window.location.hash.replace('#/', '').split('?')[0];
-    return hash || 'home';
-  });
+  const initial = parseHash(window.location.hash);
 
-  const [pageParams, setPageParams] = useState(() => {
-    const hash = window.location.hash;
-    const parts = hash.split('?');
-    if (parts[1]) {
-      const params = new URLSearchParams(parts[1]);
-      return Object.fromEntries(params.entries());
-    }
-    return {};
-  });
-
-  const [selectedMessId, setSelectedMessId] = useState(() => {
-    const hash = window.location.hash;
-    if (hash.startsWith('#/mess/')) {
-      return hash.replace('#/mess/', '').split('?')[0];
-    }
-    return null;
-  });
+  // Navigation state with robust hash sync
+  const [currentPage, setCurrentPage] = useState(initial.page || 'home');
+  const [pageParams, setPageParams] = useState(initial.params || {});
+  const [selectedMessId, setSelectedMessId] = useState(initial.messId || null);
 
   // Compare List (persist to localStorage)
   const [compareList, setCompareList] = useState(() => {
@@ -69,25 +81,14 @@ export function AppProvider({ children }) {
     }, 3500);
   };
 
-  // Sync hash changes
+  // Sync hash changes reliably
   useEffect(() => {
     const handleHashChange = () => {
-      const hash = window.location.hash || '#/';
-      if (hash.startsWith('#/mess/')) {
-        const id = hash.replace('#/mess/', '').split('?')[0];
-        setSelectedMessId(id);
-        setCurrentPage('mess-details');
-      } else {
-        const cleanPage = hash.replace('#/', '').split('?')[0] || 'home';
-        setCurrentPage(cleanPage);
-      }
-
-      const parts = hash.split('?');
-      if (parts[1]) {
-        const params = new URLSearchParams(parts[1]);
-        setPageParams(Object.fromEntries(params.entries()));
-      } else {
-        setPageParams({});
+      const parsed = parseHash(window.location.hash);
+      setCurrentPage(parsed.page);
+      setPageParams(parsed.params);
+      if (parsed.messId) {
+        setSelectedMessId(parsed.messId);
       }
     };
 
@@ -117,6 +118,7 @@ export function AppProvider({ children }) {
 
   // Compare helpers
   const addToCompare = (mess) => {
+    if (!mess || !mess.id) return;
     if (compareList.some((m) => m.id === mess.id)) {
       showToast(`${mess.name} is already in comparison!`, 'info');
       return;
@@ -150,12 +152,13 @@ export function AppProvider({ children }) {
 
   // Lunch pass helpers
   const saveNewPass = (pass) => {
+    if (!pass) return;
     setActivePass(pass);
-    const updated = [pass, ...passes.filter((p) => p.id !== pass.id)];
+    const updated = [pass, ...passes.filter((p) => p && p.id !== pass.id)];
     setPasses(updated);
     localStorage.setItem('quickmess_active_pass', JSON.stringify(pass));
     localStorage.setItem('quickmess_passes', JSON.stringify(updated));
-    showToast(`Lunch Pass ${pass.pass_code} confirmed!`, 'success');
+    showToast(`Lunch Pass ${pass.pass_code || ''} confirmed!`, 'success');
   };
 
   return (
