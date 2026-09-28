@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "QuickMess - Smart College Mess Finder & Queue Saver for Students",
   "main": "server/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node server/server.js",
     "server": "node server/server.js",
@@ -27,6 +30,7 @@
     "cors": "^2.8.6",
     "dotenv": "^18.0.4",
     "express": "^5.2.1",
+    "sql.js": "^1.14.2",
     "sqlite3": "^6.0.1"
   }
 }

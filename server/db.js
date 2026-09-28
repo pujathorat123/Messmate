@@ -1,22 +1,252 @@
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
 const dbPath = process.env.DATABASE_PATH || path.join(__dirname, 'quickmess.sqlite');
 
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening SQLite database:', err.message);
-  } else {
-    console.log('Connected to SQLite database at', dbPath);
-    initDatabase();
-  }
-});
+// Resilient SQLite Driver:
+// On Node 24 on Render Linux, the precompiled sqlite3 binary fails with `GLIBC_2.38 not found`
+// because Render's base OS uses GLIBC 2.35. We provide automatic fallback to WASM SQLite (sql.js)
+// which has ZERO glibc dependencies and is 100% compatible with SQLite 3 files & queries.
 
-function initDatabase() {
-  db.serialize(() => {
+class WasmDatabase {
+  constructor(filePath, onReady) {
+    this.dbPath = filePath;
+    this.queue = [];
+    this.ready = false;
+    this.rawDb = null;
+    this.saveTimeout = null;
+
+    let initSqlJs;
+    try {
+      initSqlJs = require('sql.js');
+    } catch (e) {
+      console.error('[QuickMess DB] Failed to require sql.js:', e.message);
+      if (onReady) onReady(e);
+      return;
+    }
+
+    initSqlJs()
+      .then((SQL) => {
+        this.SQL = SQL;
+        if (fs.existsSync(this.dbPath)) {
+          try {
+            const fileBuffer = fs.readFileSync(this.dbPath);
+            this.rawDb = new SQL.Database(fileBuffer);
+          } catch (e) {
+            console.warn('[QuickMess DB] Could not read existing SQLite file, creating fresh:', e.message);
+            this.rawDb = new SQL.Database();
+          }
+        } else {
+          this.rawDb = new SQL.Database();
+        }
+
+        this.ready = true;
+        console.log('[QuickMess DB] WebAssembly SQLite engine initialized successfully (GLIBC-independent)');
+        if (onReady) onReady(null);
+        this.flushQueue();
+      })
+      .catch((err) => {
+        console.error('[QuickMess DB] Failed to initialize WASM SQLite:', err);
+        if (onReady) onReady(err);
+      });
+  }
+
+  flushQueue() {
+    while (this.queue.length > 0) {
+      const task = this.queue.shift();
+      task();
+    }
+  }
+
+  saveToDisk() {
+    if (!this.ready || !this.rawDb) return;
+    try {
+      const data = this.rawDb.export();
+      fs.writeFileSync(this.dbPath, Buffer.from(data));
+    } catch (e) {
+      console.error('[QuickMess DB] Error writing to SQLite file:', e.message);
+    }
+  }
+
+  scheduleSave() {
+    if (this.saveTimeout) clearTimeout(this.saveTimeout);
+    this.saveTimeout = setTimeout(() => {
+      this.saveToDisk();
+      this.saveTimeout = null;
+    }, 40);
+  }
+
+  serialize(callback) {
+    if (!this.ready) {
+      this.queue.push(() => this.serialize(callback));
+      return;
+    }
+    if (typeof callback === 'function') {
+      callback();
+    }
+  }
+
+  run(sql, params, callback) {
+    if (typeof params === 'function') {
+      callback = params;
+      params = [];
+    }
+    params = params || [];
+
+    if (!this.ready) {
+      this.queue.push(() => this.run(sql, params, callback));
+      return this;
+    }
+
+    try {
+      this.rawDb.run(sql, params);
+      const changes = this.rawDb.getRowsModified();
+      this.scheduleSave();
+      if (typeof callback === 'function') {
+        const context = { changes };
+        callback.call(context, null);
+      }
+    } catch (err) {
+      if (typeof callback === 'function') {
+        callback(err);
+      } else {
+        console.error('[QuickMess DB] SQL run error:', err.message, sql);
+      }
+    }
+    return this;
+  }
+
+  get(sql, params, callback) {
+    if (typeof params === 'function') {
+      callback = params;
+      params = [];
+    }
+    params = params || [];
+
+    if (!this.ready) {
+      this.queue.push(() => this.get(sql, params, callback));
+      return this;
+    }
+
+    try {
+      const stmt = this.rawDb.prepare(sql);
+      stmt.bind(params);
+      let row = null;
+      if (stmt.step()) {
+        row = stmt.getAsObject();
+      }
+      stmt.free();
+      if (typeof callback === 'function') {
+        callback(null, row || undefined);
+      }
+    } catch (err) {
+      if (typeof callback === 'function') {
+        callback(err);
+      } else {
+        console.error('[QuickMess DB] SQL get error:', err.message, sql);
+      }
+    }
+    return this;
+  }
+
+  all(sql, params, callback) {
+    if (typeof params === 'function') {
+      callback = params;
+      params = [];
+    }
+    params = params || [];
+
+    if (!this.ready) {
+      this.queue.push(() => this.all(sql, params, callback));
+      return this;
+    }
+
+    try {
+      const stmt = this.rawDb.prepare(sql);
+      stmt.bind(params);
+      const rows = [];
+      while (stmt.step()) {
+        rows.push(stmt.getAsObject());
+      }
+      stmt.free();
+      if (typeof callback === 'function') {
+        callback(null, rows);
+      }
+    } catch (err) {
+      if (typeof callback === 'function') {
+        callback(err);
+      } else {
+        console.error('[QuickMess DB] SQL all error:', err.message, sql);
+      }
+    }
+    return this;
+  }
+
+  prepare(sql) {
+    const self = this;
+    return {
+      run(...args) {
+        let callback = null;
+        let params = [];
+        if (args.length > 0 && typeof args[args.length - 1] === 'function') {
+          callback = args.pop();
+        }
+        if (args.length === 1 && Array.isArray(args[0])) {
+          params = args[0];
+        } else {
+          params = args;
+        }
+        self.run(sql, params, callback);
+        return this;
+      },
+      finalize(callback) {
+        self.saveToDisk();
+        if (typeof callback === 'function') {
+          callback(null);
+        }
+      }
+    };
+  }
+}
+
+// Driver initialization: Try native sqlite3 first; if GLIBC or ABI issue, use WasmDatabase
+let dbInstance = null;
+let useNative = process.env.SQLITE_ENGINE !== 'wasm';
+
+if (useNative) {
+  try {
+    const sqlite3 = require('sqlite3').verbose();
+    dbInstance = new sqlite3.Database(dbPath, (err) => {
+      if (err) {
+        console.warn(`[QuickMess DB] Native SQLite error (${err.message}). Falling back to WASM SQLite...`);
+        initWasmFallback();
+      } else {
+        console.log('[QuickMess DB] Connected to native SQLite database at', dbPath);
+        initDatabase(dbInstance);
+      }
+    });
+  } catch (err) {
+    console.warn(`[QuickMess DB] Native sqlite3 failed to load (${err.message}). Activating WASM SQLite for Render Linux / Node 24...`);
+    initWasmFallback();
+  }
+} else {
+  initWasmFallback();
+}
+
+function initWasmFallback() {
+  dbInstance = new WasmDatabase(dbPath, (err) => {
+    if (err) {
+      console.error('[QuickMess DB] Fatal: Failed to initialize WASM SQLite:', err);
+    } else {
+      initDatabase(dbInstance);
+    }
+  });
+}
+
+function initDatabase(targetDb) {
+  targetDb.serialize(() => {
     // 1. Messes table
-    db.run(`
+    targetDb.run(`
       CREATE TABLE IF NOT EXISTS messes (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -24,7 +254,7 @@ function initDatabase() {
         food_type TEXT NOT NULL,
         price INTEGER NOT NULL,
         special_price INTEGER,
-        crowd_level TEXT NOT NULL, -- 'Low', 'Moderate', 'High'
+        crowd_level TEXT NOT NULL,
         wait_time_mins INTEGER NOT NULL,
         rating REAL NOT NULL,
         review_count INTEGER NOT NULL,
@@ -38,13 +268,13 @@ function initDatabase() {
         is_open INTEGER NOT NULL DEFAULT 1,
         image TEXT NOT NULL,
         today_special TEXT NOT NULL,
-        menu_items TEXT NOT NULL, -- JSON
-        features TEXT NOT NULL -- JSON
+        menu_items TEXT NOT NULL,
+        features TEXT NOT NULL
       )
     `);
 
     // 2. Reviews table
-    db.run(`
+    targetDb.run(`
       CREATE TABLE IF NOT EXISTS reviews (
         id TEXT PRIMARY KEY,
         mess_id TEXT NOT NULL,
@@ -53,15 +283,15 @@ function initDatabase() {
         crowd_experience TEXT NOT NULL,
         wait_time_reported TEXT NOT NULL,
         comment TEXT NOT NULL,
-        tags TEXT NOT NULL, -- JSON
+        tags TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         helpful_count INTEGER DEFAULT 0,
         FOREIGN KEY (mess_id) REFERENCES messes (id) ON DELETE CASCADE
       )
     `);
 
-    // 3. Confirmations (Lunch Passes / Quick Orders)
-    db.run(`
+    // 3. Confirmations table
+    targetDb.run(`
       CREATE TABLE IF NOT EXISTS confirmations (
         id TEXT PRIMARY KEY,
         mess_id TEXT NOT NULL,
@@ -81,20 +311,20 @@ function initDatabase() {
     `);
 
     // Check if initial seed is needed
-    db.get('SELECT COUNT(*) as count FROM messes', (err, row) => {
+    targetDb.get('SELECT COUNT(*) as count FROM messes', (err, row) => {
       if (err) {
-        console.error('Error counting messes:', err.message);
+        console.error('[QuickMess DB] Error counting messes:', err.message);
         return;
       }
-      if (row.count === 0) {
-        console.log('Seeding initial messes and reviews for QuickMess...');
-        seedDatabase();
+      if (!row || row.count === 0) {
+        console.log('[QuickMess DB] Seeding initial messes and reviews for QuickMess...');
+        seedDatabase(targetDb);
       }
     });
   });
 }
 
-function seedDatabase() {
+function seedDatabase(targetDb) {
   const messes = [
     {
       id: 'annapurna-mess',
@@ -323,7 +553,7 @@ function seedDatabase() {
     }
   ];
 
-  const insertMessStmt = db.prepare(`
+  const insertMessStmt = targetDb.prepare(`
     INSERT INTO messes (
       id, name, tagline, food_type, price, special_price, crowd_level, wait_time_mins,
       rating, review_count, opening_time, closing_time, distance_meters, distance_walk_time,
@@ -410,7 +640,7 @@ function seedDatabase() {
     }
   ];
 
-  const insertReviewStmt = db.prepare(`
+  const insertReviewStmt = targetDb.prepare(`
     INSERT INTO reviews (id, mess_id, student_name, rating, crowd_experience, wait_time_reported, comment, tags, helpful_count)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -436,7 +666,7 @@ function seedDatabase() {
     notes: 'Please keep 2 plates ready at Counter A'
   };
 
-  db.run(`
+  targetDb.run(`
     INSERT INTO confirmations (id, mess_id, mess_name, student_name, student_phone, meal_choice, price, party_size, estimated_arrival_mins, pass_code, status, notes)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `, [
@@ -446,7 +676,27 @@ function seedDatabase() {
     initialConfirmation.pass_code, initialConfirmation.status, initialConfirmation.notes
   ]);
 
-  console.log('Seeded database successfully with realistic campus mess data!');
+  console.log('[QuickMess DB] Seeded database successfully with realistic campus mess data!');
 }
 
-module.exports = db;
+// Proxy wrapper so calls delegate to whichever dbInstance was initialized
+const dbProxy = {
+  serialize(cb) {
+    if (dbInstance && dbInstance.serialize) return dbInstance.serialize(cb);
+    if (typeof cb === 'function') cb();
+  },
+  run(...args) {
+    return dbInstance.run(...args);
+  },
+  get(...args) {
+    return dbInstance.get(...args);
+  },
+  all(...args) {
+    return dbInstance.all(...args);
+  },
+  prepare(...args) {
+    return dbInstance.prepare(...args);
+  }
+};
+
+module.exports = dbProxy;
