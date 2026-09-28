@@ -1,0 +1,32 @@
+{
+  "name": "quickmess",
+  "version": "1.0.0",
+  "description": "QuickMess - Smart College Mess Finder & Queue Saver for Students",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "server": "node server/server.js",
+    "client": "npm --prefix client run dev",
+    "dev": "concurrently \"node server/server.js\" \"npm --prefix client run dev\"",
+    "build": "npm --prefix client install && npm --prefix client run build",
+    "test": "node test-server.js",
+    "install-all": "npm install && npm --prefix client install"
+  },
+  "keywords": [
+    "quickmess",
+    "college",
+    "mess",
+    "food",
+    "queue-tracker",
+    "student-app"
+  ],
+  "author": "QuickMess Team",
+  "license": "MIT",
+  "dependencies": {
+    "concurrently": "^10.0.5",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "sqlite3": "^6.0.1"
+  }
+}
